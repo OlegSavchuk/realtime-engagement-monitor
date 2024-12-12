@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Engagement, Gaze, and Emotion Tracker</title>
+    <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f0f0f0;
+        }
+        #video, #overlay {
+            position: absolute;
+        }
+    </style>
+</head>
+<body>
+    <video id="video" width="640" height="480" autoplay muted></video>
+    <canvas id="overlay" width="640" height="480"></canvas>
+
+    <script>
+        const socket = io();
+        const video = document.getElementById('video');
+        const overlay = document.getElementById('overlay');
+        const ctx = overlay.getContext('2d');
+
+        Promise.all([
+            faceapi.nets.tinyFaceDetector.loadFromUri('/models'),
+            faceapi.nets.faceLandmark68Net.loadFromUri('/models'),
+            faceapi.nets.faceExpressionNet.loadFromUri('/models')
+        ]).then(startVideo);
+
+        function startVideo() {
+            navigator.mediaDevices.getUserMedia({ video: {} })
+                .then(stream => {
+                    video.srcObject = stream;
+                })
+                .catch(err => console.error("Error accessing webcam: ", err));
+        }
+
+        video.addEventListener('play', () => {
+            const displaySize = { width: video.width, height: video.height };
+            faceapi.matchDimensions(overlay, displaySize);
+
+            setInterval(async () => {
+                const detections = await faceapi.detectAllFaces(video, new faceapi.TinyFaceDetectorOptions())
+                    .withFaceLandmarks()
+                    .withFaceExpressions();
+
+                ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+                const resizedDetections = faceapi.resizeResults(detections, displaySize);
+                let totalEngagement = 0;
+                let totalGazeScore = 0;
+                let emotionSummary = {};
+
+                resizedDetections.forEach((detection, index) => {
+                    const { expressions, landmarks, detection: faceDetection } = detection;
+                    const engagementScore = calculateEngagement(expressions);
+                    totalEngagement += engagementScore;
+                    const engagementLevel = getEngagementLevel(engagementScore);
+                    
+                    const gazeScore = calculateGaze(landmarks);
+                    totalGazeScore += gazeScore;
+                    const gazeStatus = getGazeStatus(gazeScore);
+
+                    const dominantEmotion = getDominantEmotion(expressions);
+                    emotionSummary[dominantEmotion] = (emotionSummary[dominantEmotion] || 0) + 1;
+
+                    drawOnCanvas(ctx, engagementLevel, gazeStatus, dominantEmotion, faceDetection.box, index);
+                });
+
+                const averageEngagement = resizedDetections.length > 0 ? totalEngagement / resizedDetections.length : 0;
+                const overallEngagementLevel = getEngagementLevel(averageEngagement);
+                
+                const averageGazeScore = resizedDetections.length > 0 ? totalGazeScore / resizedDetections.length : 0;
+                const overallGazeStatus = getGazeStatus(averageGazeScore);
+
+                const overallEmotion = Object.entries(emotionSummary).sort((a, b) => b[1] - a[1])[0]?.[0] || 'neutral';
+
+                // Send engagement, gaze, and emotion data to server
+                socket.emit('trackingData', {
+                    overallEngagementLevel,
+                    averageEngagement,
+                    overallGazeStatus,
+                    averageGazeScore,
+                    overallEmotion,
+                    emotionSummary,
+                    faceCount: resizedDetections.length
+                });
+
+            }, 1000); // Once per second
+        });
+
+        function calculateEngagement(expressions) {
+            const engagedEmotions = ['neutral', 'happy', 'surprised'];
+            const disengagedEmotions = ['sad', 'angry', 'fearful', 'disgusted'];
+            
+            let engagementScore = 0;
+            engagedEmotions.forEach(emotion => {
+                engagementScore += expressions[emotion];
+            });
+            disengagedEmotions.forEach(emotion => {
+                engagementScore -= expressions[emotion];
+            });
+
+            return Math.max(0, Math.min(1, (engagementScore + 1) / 2)); // Normalize to 0-1
+        }
+
+        function getEngagementLevel(score) {
+            if (score > 0.7) return 'High';
+            if (score > 0.4) return 'Medium';
+            return 'Low';
+        }
+
+        function calculateGaze(landmarks) {
+            const leftEye = landmarks.getLeftEye();
+            const rightEye = landmarks.getRightEye();
+            const nose = landmarks.getNose();
+
+            const leftEyeCenter = getCenterPoint(leftEye);
+            const rightEyeCenter = getCenterPoint(rightEye);
+            const noseTop = nose[0];
+
+            const eyeDistance = getDistance(leftEyeCenter, rightEyeCenter);
+            const leftEyeToNose = getDistance(leftEyeCenter, noseTop);
+            const rightEyeToNose = getDistance(rightEyeCenter, noseTop);
+
+            // Calculate gaze score based on the symmetry of distances
+            const gazeScore = 1 - Math.abs(leftEyeToNose - rightEyeToNose) / eyeDistance;
+            return gazeScore;
+        }
+
+        function getCenterPoint(points) {
+            const sum = points.reduce((acc, point) => ({x: acc.x + point.x, y: acc.y + point.y}), {x: 0, y: 0});
+            return {x: sum.x / points.length, y: sum.y / points.length};
+        }
+
+        function getDistance(point1, point2) {
+            return Math.sqrt(Math.pow(point1.x - point2.x, 2) + Math.pow(point1.y - point2.y, 2));
+        }
+
+        function getGazeStatus(score) {
+            if (score > 0.8) return 'Looking at camera';
+            return 'Not looking at camera';
+        }
+
+        function getDominantEmotion(expressions) {
+            return Object.entries(expressions).sort((a, b) => b[1] - a[1])[0][0];
+        }
+        const drawOnCanvas = (ctx, engagementLevel, gazeStatus, emotion, box, index) => {
+    const { x, y, width, height } = box;
+    
+    // Draw blue square
+    ctx.strokeStyle = 'blue';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x, y, width, height);
+
+    // Set up text properties
+    ctx.font = '10px Arial';
+    ctx.fillStyle = 'white';
+
+    // Calculate text metrics
+    const engagementText = `Engagement: ${engagementLevel}`;
+    const gazeText = `Gaze: ${gazeStatus}`;
+    const emotionText = `Emotion: ${emotion}`;
+    const textWidth = Math.max(
+        ctx.measureText(engagementText).width,
+        ctx.measureText(gazeText).width,
+        ctx.measureText(emotionText).width
+    );
+
+    // Calculate position for bottom right corner
+    const canvasWidth = ctx.canvas.width;
+    const canvasHeight = ctx.canvas.height;
+    const padding = 10;
+    const textX = canvasWidth - textWidth - padding;
+    const textY = canvasHeight - 70 - padding;
+
+    // Draw semi-transparent background for text
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';  // Semi-transparent black
+    ctx.fillRect(textX - 5, textY - 20, textWidth + 10, 70);  // +10 for padding
+
+    // Draw text
+    ctx.fillStyle = 'white';
+    ctx.fillText(engagementText, textX, textY);
+    ctx.fillText(gazeText, textX, textY + 20);
+    ctx.fillText(emotionText, textX, textY + 40);
+  };
+    </script>
+</body>
+</html>
